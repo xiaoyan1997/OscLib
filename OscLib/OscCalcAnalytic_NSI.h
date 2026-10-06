@@ -1,6 +1,34 @@
 #ifndef OSCCALCANALYTIC_NSI_H
 #define OSCCALCANALYTIC_NSI_H
 
+// ============================================================================
+// Why this class exists
+// ---------------------
+// Stan HMC needs the GRADIENT of the likelihood with respect to every fit
+// parameter, which Stan gets by automatic differentiation (autodiff) through
+// the oscillation calculator, with T = stan::math::var.  The exact NSI
+// calculator, OscCalcPMNS_NSI, diagonalises the Hamiltonian numerically;
+// under autodiff that cost ~0.97 s per likelihood evaluation.  This class
+// computes the same probabilities in CLOSED FORM -- eigenvalues from Cardano's
+// cubic formula, probabilities from a finite polynomial in the Hamiltonian --
+// so autodiff is cheap: ~0.037 s per evaluation with systematics (~26x).
+//
+// It is upstream OscCalcAnalytic (unchanged, in OscCalcAnalytic.h/.cxx) with
+// one physics change: the matter term of the Hamiltonian carries the NSI
+// matrix epsilon (see _P in the .cxx).  It is the calculator behind the Stan
+// HMC NSI productions from 8 July 2026 on (fit_stan_2024_analytic_NSI.C).
+//
+// Validation
+//  * probabilities against OscCalcPMNS_NSI: test_nsi_all_channels.C, all
+//    channels and phases, max |difference| ~ 1e-14 (rounding);
+//  * autodiff gradients against finite differences: min_grad_test.C
+//    (AD = FD), cubic_grad_test.C, and test_cubic_grad_from_nsi_cxx below
+//    (in the .cxx).
+//  * History: the first runs (7-8 July) saw ZERO epsilon gradients.  The
+//    cause was a stale libOscLib.so that had not been rebuilt after this class
+//    was added -- not the mathematics.  After the rebuild AD matched FD.
+// ============================================================================
+
 // OscCalcAnalytic_NSI: NSI-capable oscillation calculator based on OscCalcAnalytic.
 // Adds the full 9-parameter NSI matter Hamiltonian (Cardano eigensolver).
 // Internal NSI storage: polar (magnitude + phase) matching OscCalcPMNS_NSI API
@@ -37,6 +65,12 @@ namespace osc::analytic
 
     virtual TMD5* GetParamsHash() const override;
 
+    // Units and conventions (same as OscCalcPMNS_NSI, so FitVarsNSI can use
+    // either calculator): epsilons are dimensionless, in units of the
+    // charged-current potential V_CC; phases in RADIANS (the fit variables
+    // convert from units of pi).  Each setter only clears the probability
+    // cache: epsilon enters the matter part of the Hamiltonian, which is
+    // rebuilt in _P on every uncached call anyway.
     // NSI parameters — polar storage, matching OscCalcPMNS_NSI API.
     // Diagonal epsilons are real (no phase).
     // Off-diagonal: magnitude (eps) + phase (delta).
@@ -62,6 +96,8 @@ namespace osc::analytic
 
     // Cartesian convenience setters (Re/Im → magnitude/phase conversion).
     // Useful for test scripts and initialization.
+    // NOTE: these take plain doubles, so they are for tests and starting
+    // values only; nothing differentiable should go through them.
     void SetEps_emu_cart  (double re, double im) {
       fEps_emu = std::sqrt(re*re + im*im);
       fDelta_emu = std::atan2(im, re);
@@ -87,6 +123,10 @@ namespace osc::analytic
 
     template<class VT, class KVT> VT _P(int from, int to, const KVT& E);
 
+    // Caching, inherited from upstream OscCalcAnalytic: the PMNS elements and
+    // the vacuum Hamiltonian are recomputed only when an angle or mass
+    // splitting changed ("dirty"); probabilities per energy are cached in the
+    // ProbCache bases until any parameter changes.
     bool fDirty12, fDirty13, fDirty23, fDirtyCP, fDirtyMasses;
 
     T s12, c12, s13, c13, s23, c23, sCP, cCP;
@@ -97,6 +137,10 @@ namespace osc::analytic
 
     inline __attribute__((always_inline)) void UpdatePMNS();
 
+    // VACUUM Hamiltonian in the flavour basis, times 2E (units eV^2):
+    //   H = U diag(0, dm21, dm31) U^dagger.  Hermitian, so 3 real diagonal and
+    //   3 complex upper-triangle elements suffice.  The matter + NSI part is
+    //   added in _P, because it does not scale with 1/E.
     T Hee;            cmplx<T>  Hem; cmplx<T>  Het;
     /*cmplx<T> Hme;*/ T         Hmm; cmplx<T>  Hmt;
     /*cmplx<T> Hte; cmplx<T>  Htm;*/ T         Htt;
@@ -104,6 +148,8 @@ namespace osc::analytic
     inline __attribute__((always_inline)) void UpdateHamiltonian();
     inline __attribute__((always_inline)) double Hmat();
 
+    // Stored as type T (not double): with T = stan::math::var every epsilon is
+    // a node on Stan's autodiff tape, which is what gives HMC its gradients.
     // NSI epsilon parameters — polar storage, type T so Stan gradients flow through.
     T fEps_ee      = T(0);
     T fEps_mumu    = T(0);

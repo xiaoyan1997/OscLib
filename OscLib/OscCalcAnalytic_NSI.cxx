@@ -1,6 +1,27 @@
 #ifdef OSCLIB_STAN
 #include "OscLib/Stan.h"
 #endif
+// ============================================================================
+// OscCalcAnalytic_NSI.cxx -- closed-form three-flavour oscillation
+// probabilities in matter WITH NSI, differentiable by Stan autodiff.
+//
+// Reading order:
+//   1. _P (near the end): the physics.  Builds M = -L * H for the full
+//      Hamiltonian (vacuum + matter + NSI), then the probabilities.
+//   2. Hermitian<T>::GetEigenvalues + SolveCubicNSI: eigenvalues of M in
+//      closed form, and the sums the probability formula needs.
+//   3. Setters, UpdatePMNS, UpdateHamiltonian: the vacuum part, unchanged
+//      from upstream OscCalcAnalytic.
+//   4. The block of small templates at the top only re-declares helpers that
+//      upstream keeps inside OscCalcAnalytic.cxx (see the comments there).
+//
+// The physics in one line:
+//   H = (1/2E) U diag(0, dm21, dm31) U^dagger  +  V_CC [ diag(1,0,0) + eps ],
+//   V_CC = sqrt(2) G_F N_e,   eps = Hermitian 3x3,  eps_ab = |eps_ab| e^{i delta_ab},
+//   amplitude S = exp(-i H L),   P(a -> b) = |S_ba|^2.
+// Standard oscillations are eps = 0, where this reduces to upstream exactly.
+// ============================================================================
+
 
 #include "OscLib/OscCalcAnalytic_NSI.h"
 
@@ -9,6 +30,11 @@
 
 #include "OscLib/Constants.h"
 
+// Why the helpers below are duplicated: upstream defines sincos(var), the cmplx
+// operators, the cubic solver and GetEigenvalues inside OscCalcAnalytic.cxx,
+// not in a header, so this separate translation unit cannot see them and must
+// provide its own.  They are templates (weak symbols), and the ones that could
+// clash by name are renamed (sqrN, cubeN, SolveCubicNSI, kSqrt3_NSI).
 // Stan sincos — defined once in OscCalcAnalytic.cxx; forward-declare here.
 #ifdef OSCLIB_STAN
 void sincos(const stan::math::var& x, stan::math::var* sx, stan::math::var* cx);
@@ -104,6 +130,17 @@ namespace osc::analytic
   // with the same-named variable in OscCalcAnalytic.cxx.
   static constexpr double kSqrt3_NSI = 1.7320508075688772935;
 
+  // ---------------------------------------------------------------------------
+  // Cardano's TRIGONOMETRIC solution of a cubic with three real roots.
+  // M is Hermitian, so its characteristic polynomial always has three real
+  // roots; in that case p < 0 and the roots are
+  //   x_k = 2 sqrt(-p) cos( (1/3) acos( q / (2 p sqrt(-p)) ) - 2 pi k / 3 ) - b/3,
+  // with p and q the depressed-cubic coefficients computed in the first lines.
+  // (t0, t1, t2 below are those three cosines written with sin/cos of one
+  // angle r; t2 uses that the shifted roots sum to zero.)  Every operation is
+  // a smooth function -- sqrt, acos, sincos -- so autodiff differentiates it
+  // directly, which is the reason for using the closed form at all.
+  // Same algorithm as upstream's solver.
   /// Solve x^3 + b*x^2 + c*x + d = 0  (NSI version uses sqrN/cubeN to avoid ODR)
   template<class T> std::array<T, 3> SolveCubicNSI(T b, T c, T d)
   {
@@ -129,6 +166,20 @@ namespace osc::analytic
   // and its definition in OscCalcAnalytic.cxx is not visible in this TU.
   // Template method → weak symbol → linker picks one; both implementations
   // are mathematically identical.
+  // Eigenvalues of M from its characteristic polynomial
+  //   det(x I - M) = x^3 + b x^2 + c x + d,
+  //   b = -trace M,  c = sum of the three principal 2x2 minors,  d = -det M,
+  // written out for a Hermitian M (|M_em|^2 etc. are the .norm() terms).
+  //
+  // It then returns the three sums the probability formula needs:
+  //   sume   = sum_k  e^{i x_k}        / p'(x_k)
+  //   sumxe  = sum_k  x_k e^{i x_k}    / p'(x_k)
+  //   sumxxe = sum_k  x_k^2 e^{i x_k}  / p'(x_k),     p'(x) = 3x^2 + 2bx + c,
+  // with the common phase e^{i x_0} factored out (it cancels in |amplitude|^2).
+  // These come from Sylvester's formula for a matrix function:
+  //   exp(iM) = sum_k e^{i x_k} adj(x_k I - M) / p'(x_k),
+  // and adj(x I - M) is a quadratic polynomial in x whose coefficients are
+  // entries and cofactors of M -- that is the combination used in _P.
   template<class T> Eigenvalues<T> Hermitian<T>::GetEigenvalues()
   {
     const auto& M = *this;
@@ -268,6 +319,9 @@ namespace osc::analytic
   }
 
   //---------------------------------------------------------------------------
+  // Vacuum Hamiltonian (times 2E) in the flavour basis:
+  //   H_ab = dm21 U_a2 U_b2^*  +  dm31 U_a3 U_b3^*     (the m1 = 0 column drops out).
+  // Unchanged from upstream.
   template<class T> void _OscCalcNSI<T>::UpdateHamiltonian()
   {
     const T d2 = this->fDmsq21;
@@ -288,7 +342,14 @@ namespace osc::analytic
   template<class T> template<class VT, class KVT> VT _OscCalcNSI<T>::
   _P(int from, int to, const KVT& E)
   {
+    // Antineutrinos (negative PDG codes): evaluate the neutrino formula at -E.
+    // That flips the sign of the vacuum term only, giving M' = -conj(M_anti),
+    // where M_anti is the true antineutrino matrix (U -> U*, V -> -V,
+    // eps -> eps*).  Then exp(iM') = conj(exp(i M_anti)), and the
+    // probabilities |.|^2 are identical.  So the NSI phases are conjugated
+    // correctly for antineutrinos with no extra code (commit 4a6aa43).
     if(from < 0) return P(-from, -to, -E);
+
 
     assert(from > 0 && to > 0);
     assert(from == 12 || from == 14 || from == 16);
@@ -316,17 +377,30 @@ namespace osc::analytic
 
     fDirty12 = fDirty13 = fDirty23 = fDirtyCP = fDirtyMasses = false;
 
+    // Work with the dimensionless matrix M = -L * H (so that S = exp(iM)).
+    // k = -L / (2E) with L in km, E in GeV, converted so that (eV^2) * k is a
+    // pure number:  vacuum part = H_vac(2E) * k.
     const KVT k = (constants::kkmTom / (constants::kInversemToeV * constants::kGeVToeV * 2) * -this->fL) / E;
     Hermitian<VT> M;
     // NSI matter Hamiltonian: H_mat += A_cc * eps_ab.
     // Off-diagonal eps stored as polar (magnitude + phase); convert to Cartesian here.
     // A_nsi = A_cc * L in units compatible with k above.
+    // A_nsi = L * V_CC, the matter potential (Hmat = sqrt(2) G_F N_e from the
+    // density rho and Z/A = 0.5) times the baseline, in the same units.  It is
+    // the same number upstream subtracts from M.ee; the name only says that it
+    // now also multiplies the NSI matrix.
     const double A_nsi = this->fL * constants::kkmTom / constants::kInversemToeV * Hmat();
     // Polar → Cartesian for off-diagonal epsilons.
     T sde, cde, see, cee, smt, cmt;
     sincos(fDelta_emu,   &sde, &cde);
     sincos(fDelta_etau,  &see, &cee);
     sincos(fDelta_mutau, &smt, &cmt);
+    // THE NSI CHANGE.  Upstream has only M.ee = Hee*k - A_nsi (the standard
+    // MSW term, V_CC on the ee entry).  With NSI the matter term is
+    // V_CC (diag(1,0,0) + eps), so every entry gets -A_nsi * eps_ab:
+    //   diagonal:      eps_ee (added to the 1), eps_mumu, eps_tautau  (real)
+    //   off-diagonal:  eps_ab = |eps_ab| (cos delta_ab + i sin delta_ab)
+    // Only the upper triangle (em, et, mt) is stored; M is Hermitian.
     M.ee = Hee * k  - A_nsi * (1.0 + fEps_ee);
     M.em = Hem * k  - A_nsi * cmplx<T>(fEps_emu   * cde, fEps_emu   * sde);
     M.mm = Hmm * k  - A_nsi * fEps_mumu;
@@ -334,6 +408,11 @@ namespace osc::analytic
     M.mt = Hmt * k  - A_nsi * cmplx<T>(fEps_mutau * cmt, fEps_mutau * smt);
     M.tt = Htt * k  - A_nsi * fEps_tautau;
 
+    // Amplitudes from Sylvester's formula (see GetEigenvalues):
+    //   S_ab ~ cofactor_ab * sume  +/-  (linear in M) * sumxe  (+ sumxxe on the diagonal).
+    // Aee, Amm, Aem are the needed 2x2 cofactors of M.  Probs takes the four
+    // independent probabilities P(e->e), P(mu->e), P(e->mu), P(mu->mu) and
+    // fills the other five by unitarity (Probs in Cache.h).
     const Eigenvalues<VT> es = M.GetEigenvalues();
     const VT Aee = M.mm*M.tt - M.mt.norm();
     const VT Amm = M.ee*M.tt - M.et.norm();
@@ -344,6 +423,7 @@ namespace osc::analytic
                        (Aem.conj()*es.sume +  M.em.conj()*es.sumxe            ).norm(),
                        (Amm       *es.sume - (M.ee+M.tt) *es.sumxe + es.sumxxe).norm());
 
+    // Cache per energy until a parameter changes.
     ProbCache<KVT, VT>::emplace(E, ps);
 
     return ps.P(from, to);
@@ -372,6 +452,8 @@ namespace osc::analytic
 } // namespace osc::analytic
 
 
+// double: used by ARIA/tempering (no gradients).  stan::math::var: used by
+// Stan HMC (gradients via autodiff); compiled only in OSCLIB_STAN builds.
 // Explicit instantiations
 template class osc::analytic::_OscCalcNSI<double>;
 
@@ -380,6 +462,8 @@ template class osc::analytic::_OscCalcNSI<stan::math::var>;
 #endif
 
 #ifdef OSCLIB_STAN
+// Kept from the 8 July gradient investigation: compares the autodiff derivative
+// of a cubic root with a central finite difference, from inside this TU.
 // Test helper: calls SolveCubicNSI<var> from within this TU to check gradient propagation.
 // Exposed as a plain C++ function callable from test macros.
 extern "C" {
